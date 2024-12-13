@@ -1,0 +1,1 @@
+https://catalog.workshops.aws/well-architected-security/en-US/4-infrastructure-protection/autonomous-patching-with-ec2-image-builder-and-systems-manager

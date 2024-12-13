@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Application Load Balancer, NAT, and Auto Scaling Group for EC2 instances running a Python web application.
+
+Parameters:
+  AMIID:
+    Type: String
+    Description: the AMI ID
+
+  VPCImportName:
+    Type: String
+    Description: The name of the exported VPC ID value from another stack.
+
+  PublicSubnet1ImportName:
+    Type: String
+    Description: The name of the exported Public Subnet 1 ID value from another stack.
+
+  PublicSubnet2ImportName:
+    Type: String
+    Description: The name of the exported Public Subnet 2 ID value from another stack.
+
+  PrivateSubnet1ImportName:
+    Type: String
+    Description: The name of the exported Private Subnet 1 ID value from another stack.
+
+  PrivateSubnet2ImportName:
+    Type: String
+    Description: The name of the exported Private Subnet 2 ID value from another stack.
+
+Resources:
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !ImportValue
+        Fn::Sub: '${PublicSubnet1ImportName}'
+      ConnectivityType: public
+
+  RouteTablePrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${VPCImportName}'
+
+  RoutePrivate:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  RouteTableAssociationPrivate1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      SubnetId: !ImportValue
+        Fn::Sub: '${PrivateSubnet1ImportName}'
+
+  RouteTableAssociationPrivate2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      SubnetId: !ImportValue
+        Fn::Sub: '${PrivateSubnet2ImportName}'
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instances
+      VpcId: !ImportValue
+        Fn::Sub: '${VPCImportName}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup # Allow ALB to connect to instances
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: PythonWebAppTemplate
+      LaunchTemplateData:
+        InstanceType: t3.micro
+        ImageId: !Ref AMIID # Replace with a valid AMI ID for your region
+        SecurityGroupIds:
+          - !GetAtt EC2SecurityGroup.GroupId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y python3
+            yum install -y python3-pip
+            cat << 'EOF' > /home/ec2-user/app.py
+            from flask import Flask, jsonify
+            import os
+            app = Flask(__name__)
+            @app.route('/')
+            def info():
+                return jsonify({
+                    'AMI_ID': os.getenv('AMI_ID', 'Unknown'),
+                    'Packages': 'python3, flask'
+                })
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)
+            EOF
+            python3 -m pip install flask
+            python3 /home/ec2-user/app.py &
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${VPCImportName}'
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${PublicSubnet1ImportName}'
+        - !ImportValue
+          Fn::Sub: '${PublicSubnet2ImportName}'
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the ALB
+      VpcId: !ImportValue
+        Fn::Sub: '${VPCImportName}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: '${PrivateSubnet1ImportName}'
+        - !ImportValue
+          Fn::Sub: '${PrivateSubnet2ImportName}'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+#    CreationPolicy:
+#      ResourceSignal:
+#        Count: 2
+#        Timeout: PT10M
+#      AutoScalingCreationPolicy:
+#        MinSuccessfulInstancesPercent: 100
+
+Outputs:
+  LoadBalancerDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: DNS name of the load balancer.
+  OutputApplicationStack:
+    Description: Pattern3 Application Stack Name
+    Value: !Sub ${AWS::StackName}
+    Export:
+      Name: !Sub "${AWS::StackName}"
